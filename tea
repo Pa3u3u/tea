@@ -1,0 +1,433 @@
+#!/bin/perl
+
+use v5.38;
+use utf8;
+
+use experimental qw{builtin for_list try};
+
+use Env qw{$TEA_APP $TEA_SERVICE $TEA_INTERFACE};
+use File::Basename;
+use FindBin qw{$Script};
+
+BEGIN {
+	$::APP = $TEA_APP // basename($Script);
+	$::SERVICE = $TEA_SERVICE // 'org.brewing.Tea';
+	$::INTERFACE = $TEA_INTERFACE // $TEA_SERVICE // $::SERVICE;
+}
+
+
+# -----------------------------------------------------------------------------
+package Tea::Message;
+# -----------------------------------------------------------------------------
+
+use IPC::System::Simple qw{capturex systemx};
+
+sub new($class, $spec) {
+	return bless { spec => $spec }, $class;
+}
+
+sub _n($n, $base, $suffix = 's') {
+	return $base if $n == 1;
+	return $base . $suffix;
+}
+
+sub notify($self, $percent, $remaining) {
+	my $beverage = lc $::APP;
+	my $title = "Brewing $beverage";
+	my $body = join ' ', 'Please wait', $remaining, _n($remaining, 'second');
+
+	my @id = defined $self->{id} ? ("-r", $self->{id}) : ();
+
+	my $out = capturex(qw{notify-send -p -a tea -u low}, @id, '-h', "int:value:$percent",
+			$title, $body);
+
+	chomp $out;
+	$self->{id} //= $out;
+}
+
+sub done($self) {
+	my $beverage = ucfirst $::APP;
+	systemx(qw{notify-send -a tea -u critical -r}, $self->{id},
+			"$beverage is ready", "Enjoy!");
+}
+
+sub aborted($self) {
+	my $beverage = lc $::APP;
+	systemx(qw{notify-send -a tea -u normal -r}, $self->{id},
+			"Brewing aborted", "No $beverage for you!");
+}
+
+
+# -----------------------------------------------------------------------------
+package Tea::DBus::Object;
+# -----------------------------------------------------------------------------
+
+use Net::DBus::Exporter ($::INTERFACE);
+use parent qw{Net::DBus::Object};
+
+sub new($class, $service, $tea, $condvar) {
+	my $prefix = ($::SERVICE =~ s{\.}{/}gr);
+	my $self = $class->SUPER::new($service, "/$prefix/$::APP/$$");
+
+	$self->{_tea} = $tea;
+	$self->{_condvar} = $condvar;
+
+	return $self;
+}
+
+sub tea($self) {
+	return $self->{_tea};
+}
+
+dbus_property('Total', 'uint64', 'read');
+sub Total($self) {
+	return $self->tea->total;
+}
+
+dbus_property('Remaining', 'uint64', 'read');
+sub Remaining($self) {
+	return $self->tea->remaining;
+}
+
+dbus_property('Progress', 'double', 'read');
+sub Progress($self) {
+	return $self->tea->progress;
+}
+
+dbus_method('Stop', [], [], { no_return => 1 });
+sub Stop($self) {
+	$self->tea->abort;
+	$self->{_condvar}->send;
+}
+
+
+# -----------------------------------------------------------------------------
+package Tea::DBus;
+# -----------------------------------------------------------------------------
+
+use Net::DBus;
+use XML::Twig;
+
+sub get_objects() {
+	my $dbus = Net::DBus->session;
+
+	try {
+		my $service = $dbus->get_service($::SERVICE);
+
+		my $prefix = ($::SERVICE =~ s{\.}{/}gr);
+		my $object = $service->get_object(
+			"/$prefix/$::APP", 'org.freedesktop.DBus.Introspectable');
+
+		my $xml = XML::Twig->new;
+		$xml->parse($object->Introspect);
+
+		my $objects = {};
+		foreach my $node ($xml->root->children('node')) {
+			if (defined (my $pid = $node->att('name'))) {
+				$objects->{$pid} = $service->get_object(
+					"/$prefix/$::APP/$pid",
+				);
+			}
+		}
+
+		return $objects;
+	} catch ($ex) {
+		chomp $ex;
+
+		if ($ex =~ /^org.freedesktop.DBus.Error.ServiceUnknown/) {
+			return {};
+		}
+
+		die $ex;
+	}
+}
+
+sub Start($tea, $cv) {
+	my $dbus = Net::DBus->session;
+
+	# Check that there is no other instance running.
+	my $objects = get_objects;
+	if (keys $objects->%* != 0) {
+		die "$::APP: Service exists, another timer is running";
+	}
+
+	my $service = $dbus->export_service($::SERVICE);
+	my $object = Tea::DBus::Object->new($service, $tea, $cv);
+
+	return $object;
+}
+
+sub List() {
+	my $objects = get_objects;
+	foreach my $pid (sort keys $objects->%*) {
+		my $object = $objects->{$pid};
+
+		try {
+			printf "%8d  %4d of %4d seconds remaining (%6.2f%%)\n",
+				$pid, $object->Remaining, $object->Total, $object->Progress * 100;
+		} catch ($ex) {
+			chomp $ex;
+			say STDERR "$pid: $ex";
+		}
+	}
+}
+
+sub Stop() {
+	my $objects = get_objects;
+
+	foreach my ($pid, $object) ($objects->%*) {
+		try {
+			$object->Stop;
+			say "$pid stopped";
+		} catch ($ex) {
+			chomp $ex;
+			say STDERR "$pid: $ex";
+		}
+	}
+}
+
+
+# -----------------------------------------------------------------------------
+package Tea;
+# -----------------------------------------------------------------------------
+
+use POSIX qw{ceil};
+
+sub new($class, $timespec, $seconds, $timeout = 0.1) {
+	return bless {
+		timespec => $timespec,
+		seconds => $seconds,
+		expired => 0,
+		timeout => $timeout,
+		message => Tea::Message->new($timespec),
+	}, $class;
+}
+
+sub total($self) {
+	return $self->{seconds};
+}
+
+sub progress($self) {
+	return $self->{expired} * $self->{timeout} / $self->{seconds};
+}
+
+sub remaining($self) {
+	return ceil($self->{seconds} - $self->{expired} * $self->{timeout})
+}
+
+sub abort($self) {
+	$self->{message}->aborted;
+	$self->{aborted} = 1;
+}
+
+sub step($self) {
+	my $percent = int($self->progress * 100);
+	my $remaining = $self->remaining;
+
+	$self->{message}->notify($percent, $remaining);
+	$self->{expired}++;
+
+	if ($self->{expired} * $self->{timeout} > $self->{seconds}) {
+		$self->{message}->done;
+		return;
+	}
+
+	return 1;
+}
+
+sub Start($timespec, $seconds, $timeout = 0.1) {
+	__PACKAGE__->new($timespec, $seconds, $timeout)->run;
+}
+
+
+# -----------------------------------------------------------------------------
+package main;
+# -----------------------------------------------------------------------------
+
+use AnyEvent;
+use AnyEvent::DBus;
+use Getopt::Long;
+use List::Util qw{reduce};
+use Pod::Usage;
+
+sub usage() {
+	my $program_name = basename($Script);
+	die "usage: $program_name [ S | [M]M:SS | [H]H:MM:SS | [Mm[in]] [Ss[ec]] ]\n";
+}
+
+sub convert($timespec) {
+	return reduce { $a * 60 + $b } split /:|\s+/, $timespec
+		if $timespec =~ /^\d{1,2}((:|\s+)\d{2}){0,2}$/ || $timespec =~ /^\d+$/;
+
+	return ($+{min} // 0) * 60 + ($+{sec} // 0)
+		if $timespec ne "" && $timespec =~ /^((?<min>\d+)m(in)?)?\s*((?<sec>\d+)s(ec)?)?$/;
+
+	usage();
+}
+
+GetOptions($::OPTIONS = {}, qw{
+	h help man
+	stop|s
+	list|l
+	foreground|f
+}) or pod2usage;
+
+foreach my ($ix, $opt) (builtin::indexed (qw{h help man})) {
+	pod2usage(-exitval => 0, -verbose => $ix) if $::OPTIONS->{$opt};
+}
+
+if ($::OPTIONS->{stop}) {
+	Tea::DBus::Stop;
+	exit 0;
+}
+
+if ($::OPTIONS->{list}) {
+	Tea::DBus::List;
+	exit 0;
+}
+
+unless ($::OPTIONS->{foreground}) {
+	my $pid = fork;
+
+	die "fork(): $!"
+		unless defined $pid;
+
+	exit 0 if $pid != 0;
+}
+
+my $spec = @ARGV ? join ' ', @ARGV : '3:00';
+my $time = convert($spec);
+
+die "Only positive duration is allowed\n"
+	if $time <= 0;
+
+my $tea = Tea->new($spec, $time);
+
+my $cv = AnyEvent->condvar;
+my $w_tea = AnyEvent->timer(after => $tea->{timeout}, interval => $tea->{timeout},
+	cb => sub {
+		 $cv->send unless $tea->step;
+	});
+
+my @w_sig;
+foreach my $sig (qw{INT QUIT TERM}) {
+	push @w_sig, AnyEvent->signal(signal => $sig, cb => sub {
+		$tea->abort;
+		$cv->send;
+	});
+}
+
+my $dbus = Tea::DBus::Start($tea, $cv);
+
+$cv->recv;
+
+
+=encoding utf-8
+
+=head1 NAME
+
+C<tea> - Show notification with time progress intended for tea brewing
+
+=head1 SYNOPSIS
+
+The program accepts various formats for the timer:
+
+	tea SECONDS
+	tea [[HH:]MM:]SS
+	tea [MMm[in]] [SSs[ec]]
+
+The timer can be stopped via D-Bus by running
+
+	tea --stop
+
+=head1 OPTIONS AND ARGUMENTS
+
+=over
+
+=item C<-h>, C<--help>, C<--man>
+
+Display the synopsis, documentation or the manual.
+
+=item C<-s>, C<--stop>
+
+Stop a running timer over D-Bus.
+
+=item C<-l>, C<--list>
+
+If a timer is running, prints its PID and remaining time.
+
+=item C<-f>, C<--foreground>
+
+Run the timer in the foreground. The default is to fork and run in the
+background.
+
+=back
+
+=head1 DESCRIPTION
+
+This script starts a timer for the specified short amount of time.
+A notification with progress bar is displayed, and when the timer expires,
+another notification is used to replace the progress bar.
+
+=head2 Notifications
+
+All notifications have application name set to the base name of the script.
+This can be used to symlink the script under different names (e.g. C<coffee>)
+with different notification styles.
+
+A list of other differences per notification follows.
+
+=over
+
+=item Progress
+
+Progress notification has a progress bar and B<low> priority.
+
+=item Aborted
+
+When the timer is aborted (either by a signal or D-Bus), a B<normal> priority
+notification is displayed with the message.
+
+=item Finished
+
+When the timer finishes, a B<critical> priority notification is displayed.
+
+=back
+
+=head2 D-Bus
+
+The script creates a service C<org.brewing.Tea> with an object implementing
+a C<org.brewing.Tea> interface. An object is created under the path
+C</org/brewing/Tea/$APP/$PID> where C<$APP> is the base name of the executed
+script. This allows to have different script symlinked and controlled over
+D-Bus.
+
+=head1 ENVIRONMENT VARIABLES
+
+=over
+
+=item C<TEA_APP>
+
+Use this as an application name instead of base name of the script.
+
+This is an alternative to creating a symlink to the script.
+
+=item C<TEA_SERVICE>
+
+Overrides D-Bus service name.
+
+=item C<TEA_INTERFACE>
+
+Overrides D-Bus interface name.
+
+=back
+
+=head1 BUGS
+
+Before a timer is started, the script tries to check that there is no other
+timer running, as exporting another service with C<Net::DBus> does not cause
+a conflict. However, this creates a race condition; if multiple timers are
+started at the same time, the check might fail. If this happens, C<--stop> will
+only stop the timer that assumed the well-known name, and it will also be the
+only instance listed by C<--list>. The other timer can only be stopped by
+finding its PID and sending it a signal, or issuing a manual D-Bus call.

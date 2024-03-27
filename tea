@@ -21,6 +21,7 @@ package Tea::Message;
 # -----------------------------------------------------------------------------
 
 use IPC::System::Simple qw{capturex systemx};
+use Time::Duration;
 
 sub new($class, $spec) {
 	return bless { spec => $spec }, $class;
@@ -34,7 +35,7 @@ sub _n($n, $base, $suffix = 's') {
 sub notify($self, $percent, $remaining) {
 	my $beverage = lc $::APP;
 	my $title = "Brewing $beverage";
-	my $body = join ' ', 'Please wait', $remaining, _n($remaining, 'second');
+	my $body = 'Please wait ' . duration($remaining);
 
 	my @id = defined $self->{id} ? ("-r", $self->{id}) : ();
 

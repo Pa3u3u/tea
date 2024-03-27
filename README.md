@@ -35,11 +35,12 @@ The ongoing timer can be stopped via D-Bus.
 
 * Perl 5.38 or newer
 * Perl modules
-  - `IPC::System::Simple`
-  - `Net::DBus`
-  - `XML::Twig`
   - `AnyEvent`
   - `AnyEvent::DBus`
+  - `IPC::System::Simple`
+  - `Net::DBus`
+  - `Time::Duration`
+  - `XML::Twig`
 * `notify-send(1)` and a notification daemon of your choice
 
 ## Configuration

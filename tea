@@ -27,11 +27,6 @@ sub new($class, $spec) {
 	return bless { spec => $spec }, $class;
 }
 
-sub _n($n, $base, $suffix = 's') {
-	return $base if $n == 1;
-	return $base . $suffix;
-}
-
 sub notify($self, $percent, $remaining) {
 	my $beverage = lc $::APP;
 	my $title = "Brewing $beverage";
